@@ -26,6 +26,23 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+# Optional ZKP verifier — dynamically imported so app.py keeps stdlib-only deps
+_zkp_backend_dir = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "zkp", "backend")
+)
+if os.path.isdir(_zkp_backend_dir):
+    sys.path.insert(0, _zkp_backend_dir)
+    try:
+        from zkp_verifier_service import ZkpVerifierService, build_zkp_verifier  # type: ignore
+    except ImportError:
+        ZkpVerifierService = None  # type: ignore
+        def build_zkp_verifier(zkp_dir: str | None = None) -> None: return None  # type: ignore
+    finally:
+        sys.path.pop(0)
+else:
+    ZkpVerifierService = None  # type: ignore
+    def build_zkp_verifier(zkp_dir: str | None = None) -> None: return None  # type: ignore
+
 
 DEFAULT_DB = os.path.join(os.path.dirname(__file__), "demo.db")
 STATIC_ROOT = os.path.join(os.path.dirname(__file__), "static")
@@ -1355,14 +1372,18 @@ class IdentityService:
             license_record = self.store.get_licensed_institution(str(issuer))
             if not license_record or license_record["status"] != "valid":
                 reasons.append("issuer_license_invalid")
-            user = self.store.get_user(str(owner)) if owner else None
-            if not user or user["status"] != "active" or user["kyc_status"] != "verified":
-                reasons.append("owner_user_invalid")
-            owner_profile = self.store.get_kyc_aml_profile(str(owner)) if owner else None
-            if not owner_profile or owner_profile["aml_status"] != "clear":
-                reasons.append("owner_aml_profile_invalid")
-            if task["intent"] == "subscribe_fund_share" and (not owner_profile or not owner_profile["professional_investor"]):
-                reasons.append("lp_professional_investor_required")
+            # When a ZKP proof accompanies the task, the LP's KYC/AML is
+            # delegated to the ZKP verifier step — skip plaintext checks here.
+            lp_has_zkp = task["intent"] == "subscribe_fund_share" and bool(constraints.get("_zkp"))
+            if not lp_has_zkp:
+                user = self.store.get_user(str(owner)) if owner else None
+                if not user or user["status"] != "active" or user["kyc_status"] != "verified":
+                    reasons.append("owner_user_invalid")
+                owner_profile = self.store.get_kyc_aml_profile(str(owner)) if owner else None
+                if not owner_profile or owner_profile["aml_status"] != "clear":
+                    reasons.append("owner_aml_profile_invalid")
+                if task["intent"] == "subscribe_fund_share" and (not owner_profile or not owner_profile["professional_investor"]):
+                    reasons.append("lp_professional_investor_required")
         elif task["intent"] == "transfer_asset":
             for field in ("from", "to"):
                 user = self.store.get_user(str(constraints.get(field)))
@@ -1510,7 +1531,14 @@ class ComplianceEvidenceService:
         licenses: dict[str, Any] = {}
         reasons: list[str] = []
 
+        zkp_proven = task["constraints"].get("_zkp_proven", False)
+        lp_subject = str(task["constraints"].get("lp", "")) if task["intent"] == "subscribe_fund_share" else ""
+
         for subject, subject_type in subjects.items():
+            # ZKP-proven LP: skip plaintext KYC lookup, treat as verified
+            if zkp_proven and subject == lp_subject and subject_type == "user":
+                profiles[subject] = {"zkp_proven": True, "subject": subject}
+                continue
             profile = self.store.get_kyc_aml_profile(subject)
             if not profile:
                 reasons.append(f"{subject}_kyc_aml_missing")
@@ -1530,9 +1558,10 @@ class ComplianceEvidenceService:
 
         if task["intent"] == "subscribe_fund_share":
             lp = str(task["constraints"].get("lp"))
-            profile = profiles.get(lp) or self.store.get_kyc_aml_profile(lp)
-            if not profile or not profile["professional_investor"]:
-                reasons.append("lp_professional_investor_required")
+            if not (zkp_proven and lp == lp_subject):
+                profile = profiles.get(lp) or self.store.get_kyc_aml_profile(lp)
+                if not profile or not profile.get("professional_investor"):
+                    reasons.append("lp_professional_investor_required")
 
         if reasons:
             raise ValueError(",".join(reasons))
@@ -1900,6 +1929,16 @@ class Orchestrator:
         self.oracle = OracleAttestationService(store)
         self.chain = chain
         self.assets = AssetService(store)
+        _zkp_dir = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "zkp")
+        )
+        self.zkp: Any = build_zkp_verifier(os.path.join(_zkp_dir, "build"))
+        if self.zkp is not None:
+            _registry_path = os.path.join(_zkp_dir, "registry.json")
+            if os.path.exists(_registry_path):
+                with open(_registry_path) as _fh:
+                    _reg = json.load(_fh)
+                self.zkp.add_root(_reg.get("merkleRoot", ""))
 
     def create_task(self, body: dict[str, Any], idempotency_key: str | None = None) -> dict[str, Any]:
         requester = str(body.get("requester") or "anonymous")
@@ -2005,6 +2044,33 @@ class Orchestrator:
                 return
 
             task = self.store.get_task(task_id) or task
+            _zkp_payload = task["constraints"].get("_zkp")
+            if _zkp_payload and self.zkp is not None:
+                def _run_zkp(t=task, p=_zkp_payload):
+                    # taskHashCommitment is LP-chosen (publicSignals[1]); nullifier
+                    # consumption provides replay protection across tasks.
+                    result = self.zkp.verify(
+                        p["proof"],
+                        p["publicSignals"],
+                        p["publicSignals"][1],
+                    )
+                    updated = dict(t["constraints"])
+                    updated["_zkp_proven"] = True
+                    updated["_zkp_nullifier"] = result["nullifier_hash"]
+                    self.store.update_task(t["task_id"], constraints=updated)
+                    return result
+
+                self.tools.call(
+                    task_id,
+                    "privacy-agent",
+                    "tool.privacy.verifyZkpProof",
+                    {"task": task},
+                    "high",
+                    _run_zkp,
+                    policy_result="approved",
+                )
+                task = self.store.get_task(task_id) or task
+
             self.tools.call(
                 task_id,
                 "compliance-agent",
@@ -2098,6 +2164,8 @@ class Orchestrator:
     def _plan(self, task: dict[str, Any]) -> dict[str, Any]:
         tools = ["tool.identity.verifySubject", "tool.policy.evaluate"]
         if task["intent"] in {"issue_asset", "subscribe_fund_share", "invest_portfolio_equity", "record_compute_revenue"}:
+            if task["constraints"].get("_zkp") and self.zkp is not None:
+                tools.append("tool.privacy.verifyZkpProof")
             tools.append("tool.compliance.verifyKycAml")
             if task["intent"] in {"subscribe_fund_share", "invest_portfolio_equity", "record_compute_revenue"}:
                 tools.append("tool.legal.verifyRightsMapping")
@@ -2402,6 +2470,8 @@ class Orchestrator:
             constraints.setdefault("legal_document_hash", "hash-legal-compute-revenue-attestation")
             constraints.setdefault("oracle_attestation_id", "oracle-compute-aicomp-2026q2")
             constraints.setdefault("attestation_hash", constraints.get("metadata_hash"))
+        if body.get("zkp"):
+            constraints["_zkp"] = body["zkp"]
         return constraints
 
 

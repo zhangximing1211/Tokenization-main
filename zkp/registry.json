@@ -2,7 +2,13 @@
   "version": "1.0.0",
   "description": "KYC Provider Merkle Registry — managed by KYC provider, not by backend",
   "treeDepth": 16,
-  "members": [],
-  "merkleRoot": null,
-  "updatedAt": null
+  "members": [
+    {
+      "leafIndex": 0,
+      "identityCommitment": "16995687726744657448585198515895787232331913624574453128059955214774997465669",
+      "addedAt": "2026-05-23T16:36:51.969Z"
+    }
+  ],
+  "merkleRoot": "1950271686076554524968355746691833822085017778244211123366192925759053890718",
+  "updatedAt": "2026-05-23T16:36:51.969Z"
 }
