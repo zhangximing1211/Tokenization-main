@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "description": "KYC Provider Merkle Registry — managed by KYC provider, not by backend",
+  "treeDepth": 16,
+  "members": [],
+  "merkleRoot": null,
+  "updatedAt": null
+}
