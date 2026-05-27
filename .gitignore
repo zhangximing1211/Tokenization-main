@@ -14,3 +14,16 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ZKP build artifacts
+zkp/build/
+zkp/out/
+zkp/cache/
+
+# Wallet / secrets
+zkp/wallets/

@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+
+# ZKP build artifacts
+build/
+out/
+cache/
+
+# Wallet / secrets
+wallets/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Dependencies (installed via forge install)
+lib/
